@@ -23,7 +23,7 @@ jobs:
       - name: Build and push image
         uses: docker/build-push-action@v5
         with:
-          context: .
+          context: ./app
           push: true
           tags: kalaikumarrp/zero-downtime-app:latest
 
