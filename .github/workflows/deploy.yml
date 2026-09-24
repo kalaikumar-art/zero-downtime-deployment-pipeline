@@ -1,11 +1,11 @@
-name: Build and Push Docker Image
+name: Deploy to EC2 (Blue-Green)
 
 on:
   push:
-    branches: [ main ]
+    branches: [main]
 
 jobs:
-  build:
+  build-and-deploy:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -20,21 +20,76 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Build and push
+      - name: Build and push image
         uses: docker/build-push-action@v5
         with:
-          context: ./app
+          context: .
           push: true
-          tags: ${{ secrets.DOCKERHUB_USERNAME }}/zero-downtime-app:latest
+          tags: kalaikumarrp/zero-downtime-app:latest
 
-      - name: Deploy to EC2
+      - name: Blue-Green deploy over SSH
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.EC2_HOST }}
           username: ec2-user
           key: ${{ secrets.EC2_SSH_KEY }}
           script: |
-            sudo docker pull ${{ secrets.DOCKERHUB_USERNAME }}/zero-downtime-app:latest
-            sudo docker stop app || true
-            sudo docker rm app || true
-            sudo docker run -d -p 3000:3000 --name app ${{ secrets.DOCKERHUB_USERNAME }}/zero-downtime-app:latest
+            set -e
+
+            # Step 1: find which port is currently live
+            if sudo grep -q "3001" /etc/nginx/conf.d/app.conf; then
+              LIVE_PORT=3001
+              NEW_PORT=3002
+              NEW_NAME=app-green
+              OLD_NAME=app-blue
+            else
+              LIVE_PORT=3002
+              NEW_PORT=3001
+              NEW_NAME=app-blue
+              OLD_NAME=app-green
+            fi
+
+            echo "Live port is $LIVE_PORT, deploying new version to $NEW_PORT as $NEW_NAME"
+
+            # Step 2: start the new container on the free port
+            sudo docker pull kalaikumarrp/zero-downtime-app:latest
+            sudo docker rm -f $NEW_NAME || true
+            sudo docker run -d -p $NEW_PORT:3000 --name $NEW_NAME kalaikumarrp/zero-downtime-app:latest
+
+            # Step 3: health check the new container before switching traffic
+            echo "Waiting for $NEW_NAME to become healthy..."
+            for i in {1..10}; do
+              if curl -sf http://localhost:$NEW_PORT/health; then
+                echo "Health check passed"
+                break
+              fi
+              if [ $i -eq 10 ]; then
+                echo "Health check failed after 10 attempts, aborting deploy"
+                sudo docker rm -f $NEW_NAME
+                exit 1
+              fi
+              sleep 3
+            done
+
+            # Step 4: switch Nginx to point to the new port
+            sudo tee /etc/nginx/conf.d/app.conf << EOF
+            upstream app_backend {
+                server 127.0.0.1:$NEW_PORT;
+            }
+            server {
+                listen 3000;
+                location / {
+                    proxy_pass http://app_backend;
+                    proxy_set_header Host \$host;
+                    proxy_set_header X-Real-IP \$remote_addr;
+                }
+            }
+            EOF
+
+            sudo nginx -t
+            sudo systemctl reload nginx
+
+            # Step 5: remove the old container now that traffic has switched
+            sudo docker rm -f $OLD_NAME || true
+
+            echo "Deploy complete. Live port is now $NEW_PORT ($NEW_NAME)"
