@@ -5,7 +5,7 @@ const PORT = process.env.PORT || 3000;
 app.get('/', (req, res) => {
   res.json({
     message: 'Zero-Downtime Deployment Pipeline',
-    version: '1.1',
+    version: '1.2',
     status: 'running',
     timestamp: new Date().toISOString()
   });
